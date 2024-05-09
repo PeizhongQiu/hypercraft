@@ -1,3 +1,4 @@
+use aarch64_cpu::registers::SCTLR_EL2::I;
 use alloc::collections::VecDeque;
 use x86_64::registers::debug;
 use core::fmt::{Debug, Formatter, Result};
@@ -24,7 +25,7 @@ use crate::{GuestPhysAddr, HostPhysAddr, HyperCraftHal, HyperResult, HyperError,
 use super::LinuxContext;
 #[cfg(feature = "type1_5")]
 use super::segmentation::Segment;
-
+const PREEMPTION_TIMER_VALUE: u32 = 80_000_000; 
 pub struct XState {
     host_xcr0: u64,
     guest_xcr0: u64,
@@ -229,6 +230,8 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
         let msr = x86::msr::IA32_APIC_BASE;
         self.msr_bitmap.set_read_intercept(msr, true);
         self.msr_bitmap.set_write_intercept(msr, true);
+        self.msr_bitmap.set_read_intercept(0xe1, true);
+        self.msr_bitmap.set_write_intercept(0xe1, true);
         // Intercept all x2APIC MSR accesses
         for msr in 0x800..=0x83f {
             self.msr_bitmap.set_read_intercept(msr, true);
@@ -340,7 +343,7 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
 
         VmcsGuest32::INTERRUPTIBILITY_STATE.write(0)?;
         VmcsGuest32::ACTIVITY_STATE.write(0)?;
-        VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(0)?;
+        VmcsGuest32::VMX_PREEMPTION_TIMER_VALUE.write(PREEMPTION_TIMER_VALUE)?;
 
         VmcsGuest64::LINK_PTR.write(u64::MAX)?; // SDM Vol. 3C, Section 24.4.2
         VmcsGuest64::IA32_DEBUGCTL.write(0)?;
@@ -357,7 +360,7 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
             VmcsControl32::PINBASED_EXEC_CONTROLS,
             Msr::IA32_VMX_TRUE_PINBASED_CTLS,
             Msr::IA32_VMX_PINBASED_CTLS.read() as u32,
-            (PinCtrl::NMI_EXITING | PinCtrl::EXTERNAL_INTERRUPT_EXITING).bits(),
+            (PinCtrl::NMI_EXITING | PinCtrl::EXTERNAL_INTERRUPT_EXITING | PinCtrl::VMX_PREEMPTION_TIMER).bits(),
             0,
         )?;
 
@@ -399,7 +402,8 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
                 | ExitCtrl::SAVE_IA32_PAT
                 | ExitCtrl::LOAD_IA32_PAT
                 | ExitCtrl::SAVE_IA32_EFER
-                | ExitCtrl::LOAD_IA32_EFER)
+                | ExitCtrl::LOAD_IA32_EFER
+                | ExitCtrl::SAVE_VMX_PREEMPTION_TIMER)
                 .bits(),
             0,
         )?;
@@ -774,58 +778,6 @@ impl <H: HyperCraftHal> VmxVcpu<H> {
         Ok(())
     }
 
-    fn set_cr(&mut self, cr_idx: usize, val: u64) {
-        (|| -> HyperResult {
-            match cr_idx {
-                0 => {
-                    // Retrieve/validate restrictions on CR0
-                    //
-                    // In addition to what the VMX MSRs tell us, make sure that
-                    // - NW and CD are kept off as they are not updated on VM exit and we
-                    //   don't want them enabled for performance reasons while in root mode
-                    // - PE and PG can be freely chosen (by the guest) because we demand
-                    //   unrestricted guest mode support anyway
-                    // - ET is ignored
-                    let must0 = Msr::IA32_VMX_CR0_FIXED1.read()
-                        & !(Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE).bits();
-                    let must1 = Msr::IA32_VMX_CR0_FIXED0.read()
-                        & !(Cr0Flags::PAGING | Cr0Flags::PROTECTED_MODE_ENABLE).bits();
-                    VmcsGuestNW::CR0.write(((val & must0) | must1) as _)?;
-                    VmcsControlNW::CR0_READ_SHADOW.write(val as _)?;
-                    VmcsControlNW::CR0_GUEST_HOST_MASK.write((must1 | !must0) as _)?;
-                }
-                3 => VmcsGuestNW::CR3.write(val as _)?,
-                4 => {
-                    // Retrieve/validate restrictions on CR4
-                    let must0 = Msr::IA32_VMX_CR4_FIXED1.read();
-                    let must1 = Msr::IA32_VMX_CR4_FIXED0.read();
-                    let val = val | Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits();
-                    VmcsGuestNW::CR4.write(((val & must0) | must1) as _)?;
-                    VmcsControlNW::CR4_READ_SHADOW.write(val as _)?;
-                    VmcsControlNW::CR4_GUEST_HOST_MASK.write((must1 | !must0) as _)?;
-                }
-                _ => unreachable!(),
-            };
-            Ok(())
-        })()
-        .expect("Failed to write guest control register")
-    }
-
-    fn cr(&self, cr_idx: usize) -> usize {
-        (|| -> HyperResult<usize> {
-            Ok(match cr_idx {
-                0 => VmcsGuestNW::CR0.read()?,
-                3 => VmcsGuestNW::CR3.read()?,
-                4 => {
-                    let host_mask = VmcsControlNW::CR4_GUEST_HOST_MASK.read()?;
-                    (VmcsControlNW::CR4_READ_SHADOW.read()? & host_mask)
-                        | (VmcsGuestNW::CR4.read()? & !host_mask)
-                }
-                _ => unreachable!(),
-            })
-        })()
-        .expect("Failed to read guest control register")
-    }
 
     /// Create a new [`VmxVcpu`].
     pub fn new_nimbos(
@@ -845,10 +797,26 @@ impl <H: HyperCraftHal> VmxVcpu<H> {
             pending_events: VecDeque::with_capacity(8),
             xstate: XState::new(),
         };
-        // vcpu.setup_msr_bitmap()?;
+        // info!("Ia32UmwaitControl:{}", unsafe { x86::msr::rdmsr(0xe1) });
+        vcpu.setup_msr_bitmap_linux()?;
         vcpu.setup_nimbos_vmcs(entry, ept_root)?;
         info!("[HV] created VmxVcpu(vmcs: {:#x})", vcpu.vmcs.phys_addr());
         Ok(vcpu)
+    }
+
+    fn setup_msr_bitmap_linux(&mut self) -> HyperResult {
+        // Intercept IA32_APIC_BASE MSR accesses
+        let msr = x86::msr::IA32_APIC_BASE;
+        self.msr_bitmap.set_read_intercept(msr, true);
+        self.msr_bitmap.set_write_intercept(msr, true);
+        self.msr_bitmap.set_read_intercept(0xe1, true);
+        self.msr_bitmap.set_write_intercept(0xe1, true);
+        // Intercept all x2APIC MSR accesses
+        // for msr in 0x800..=0x83f {
+        //     self.msr_bitmap.set_read_intercept(msr, true);
+        //     self.msr_bitmap.set_write_intercept(msr, true);
+        // }
+        Ok(())
     }
 
     fn setup_nimbos_vmcs(&mut self, entry: GuestPhysAddr, ept_root: HostPhysAddr) -> HyperResult {
@@ -871,7 +839,7 @@ impl <H: HyperCraftHal> VmxVcpu<H> {
             VmcsControl32::PINBASED_EXEC_CONTROLS,
             Msr::IA32_VMX_TRUE_PINBASED_CTLS,
             Msr::IA32_VMX_PINBASED_CTLS.read() as u32,
-            (PinCtrl::NMI_EXITING).bits(),
+            (PinCtrl::NMI_EXITING | PinCtrl::EXTERNAL_INTERRUPT_EXITING | PinCtrl::VMX_PREEMPTION_TIMER).bits(),
             0,
         )?;
 
@@ -913,7 +881,8 @@ impl <H: HyperCraftHal> VmxVcpu<H> {
                 | ExitCtrl::SAVE_IA32_PAT
                 | ExitCtrl::LOAD_IA32_PAT
                 | ExitCtrl::SAVE_IA32_EFER
-                | ExitCtrl::LOAD_IA32_EFER)
+                | ExitCtrl::LOAD_IA32_EFER
+                | ExitCtrl::SAVE_VMX_PREEMPTION_TIMER)
                 .bits(),
             0,
         )?;
@@ -1009,6 +978,7 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
     fn allow_interrupt(&self) -> bool {
         let rflags = VmcsGuestNW::RFLAGS.read().unwrap();
         let block_state = VmcsGuest32::INTERRUPTIBILITY_STATE.read().unwrap();
+        // info!("{} {} {}", rflags, x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits(), block_state);
         rflags as u64 & x86_64::registers::rflags::RFlags::INTERRUPT_FLAG.bits() != 0
             && block_state == 0
     }
@@ -1016,8 +986,10 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
     /// Try to inject a pending event before next VM entry.
     fn inject_pending_events(&mut self) -> HyperResult {
         if let Some(event) = self.pending_events.front() {
+            // info!("inject_pending_events_1:{}, {:?}", event.0, event.1);
             if event.0 < 32 || self.allow_interrupt() {
                 // if it's an exception, or an interrupt that is not blocked, inject it directly.
+                info!("inject_pending_events_2:{}, {:?}", event.0, event.1);
                 vmcs::inject_event(event.0, event.1)?;
                 self.pending_events.pop_front();
             } else {
@@ -1043,10 +1015,112 @@ impl<H: HyperCraftHal> VmxVcpu<H> {
         match exit_info.exit_reason {
             VmxExitReason::INTERRUPT_WINDOW => Some(self.set_interrupt_window(false)),
             VmxExitReason::XSETBV => Some(self.handle_xsetbv()),
-            VmxExitReason::CR_ACCESS => panic!("Guest's access to cr not allowed: {:#x?}, {:#x?}", self, vmcs::cr_access_info()),
+            VmxExitReason::CR_ACCESS => Some(self.handle_cr()),
             VmxExitReason::CPUID => Some(self.handle_cpuid()),
+            VmxExitReason::PREEMPTION_TIMER => {
+                // static mut COUNT: u64 = 0;
+                // unsafe {
+                //     COUNT = COUNT + 1;
+                //     if COUNT % 1000 == 0 {
+                //         info!("VM-exit: external interrupt: PREEMPTION_TIMER, {COUNT}", );
+                //     }
+                // }
+                Some(Ok(()))
+            }
             _ => None,
         }
+    }
+
+    fn handle_cr(&mut self) -> HyperResult {
+        const VM_EXIT_INSTR_LEN_MV_TO_CR: u8 = 3;
+
+        let cr_access_info = vmcs::cr_access_info()?;
+
+        let reg = cr_access_info.gpr;
+        let cr = cr_access_info.cr_number;
+
+        match cr_access_info.access_type {
+            /* move to cr */
+            0 => {
+                let val = if reg == 4 {
+                    self.stack_pointer() as u64
+                } else {
+                    self.guest_regs.get_reg_of_index(reg)
+                };
+                if cr == 0 || cr == 4 {
+                    // vcpu_skip_emulated_instruction(X86_INST_LEN_MOV_TO_CR);
+                    self.advance_rip(VM_EXIT_INSTR_LEN_MV_TO_CR)?;
+                    /* TODO: check for #GP reasons */
+                    // vmx_set_guest_cr(cr ? CR4_IDX : CR0_IDX, val);
+                    self.set_cr(cr as usize, val);
+
+                    // if (cr == 0 && val & X86_CR0_PG)
+                    if cr == 0 && Cr0Flags::from_bits_truncate(val).contains(Cr0Flags::PAGING) {
+                        vmcs::update_efer()?;
+                    }
+                    return Ok(());
+                }
+            }
+            _ => {}
+        };
+
+        panic!(
+            "Guest's access to cr not allowed: {:#x?}, {:#x?}",
+            self, cr_access_info
+        );
+    }
+
+    fn set_cr(&mut self, cr_idx: usize, val: u64) {
+        (|| -> HyperResult {
+            match cr_idx {
+                0 => {
+                    // Retrieve/validate restrictions on CR0
+                    //
+                    // In addition to what the VMX MSRs tell us, make sure that
+                    // - NW and CD are kept off as they are not updated on VM exit and we
+                    //   don't want them enabled for performance reasons while in root mode
+                    // - PE and PG can be freely chosen (by the guest) because we demand
+                    //   unrestricted guest mode support anyway
+                    // - ET is ignored
+                    let must0 = Msr::IA32_VMX_CR0_FIXED1.read()
+                        & !(Cr0Flags::NOT_WRITE_THROUGH | Cr0Flags::CACHE_DISABLE).bits();
+                    let must1 = Msr::IA32_VMX_CR0_FIXED0.read()
+                        & !(Cr0Flags::PAGING | Cr0Flags::PROTECTED_MODE_ENABLE).bits();
+                    VmcsGuestNW::CR0.write(((val & must0) | must1) as _)?;
+                    VmcsControlNW::CR0_READ_SHADOW.write(val as _)?;
+                    VmcsControlNW::CR0_GUEST_HOST_MASK.write((must1 | !must0) as _)?;
+                }
+                3 => VmcsGuestNW::CR3.write(val as _)?,
+                4 => {
+                    // Retrieve/validate restrictions on CR4
+                    let must0 = Msr::IA32_VMX_CR4_FIXED1.read();
+                    let must1 = Msr::IA32_VMX_CR4_FIXED0.read();
+                    let val = val | Cr4Flags::VIRTUAL_MACHINE_EXTENSIONS.bits();
+                    VmcsGuestNW::CR4.write(((val & must0) | must1) as _)?;
+                    VmcsControlNW::CR4_READ_SHADOW.write(val as _)?;
+                    VmcsControlNW::CR4_GUEST_HOST_MASK.write((must1 | !must0) as _)?;
+                }
+                _ => unreachable!(),
+            };
+            Ok(())
+        })()
+        .expect("Failed to write guest control register")
+    }
+
+    fn cr(&self, cr_idx: usize) -> usize {
+        (|| -> HyperResult<usize> {
+            Ok(match cr_idx {
+                0 => VmcsGuestNW::CR0.read()?,
+                3 => VmcsGuestNW::CR3.read()?,
+                4 => {
+                    let host_mask = VmcsControlNW::CR4_GUEST_HOST_MASK.read()?;
+                    (VmcsControlNW::CR4_READ_SHADOW.read()? & host_mask)
+                        | (VmcsGuestNW::CR4.read()? & !host_mask)
+                }
+                _ => unreachable!(),
+            })
+        })()
+        .expect("Failed to read guest control register")
     }
 
     #[cfg(feature = "type1_5")]

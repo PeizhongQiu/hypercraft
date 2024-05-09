@@ -143,7 +143,8 @@ impl<H: HyperCraftHal, PD: PerCpuDevices<H>, VD: PerVmDevices<H>> VM<H, PD, VD> 
                         Err(e) => panic!("nmi_handler failed: {e:?}"),
                     }
                 } else {
-                    let result = vcpu_device.vmexit_handler(vcpu, &exit_info);
+                    let result = vcpu_device.vmexit_handler(vcpu, &exit_info)
+                            .or_else(|| self.device.vmexit_handler(vcpu, &exit_info));
                     debug!("this is result {:?}", result);
                     match result {
                         Some(result) => {
@@ -157,7 +158,7 @@ impl<H: HyperCraftHal, PD: PerCpuDevices<H>, VD: PerVmDevices<H>> VM<H, PD, VD> 
                     }
                 }
             }
-            // vcpu_device.check_events(vcpu)?;
+            vcpu_device.check_events(vcpu)?;
         }
     }
 
